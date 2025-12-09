@@ -1,0 +1,522 @@
+Here’s an updated, **unified Cursor prompt** with the new dashboard requirements (unpaid members + collection progress). You can paste this as-is into Cursor.
+
+---
+
+You are building a **mobile-first Telegram Mini App** for managing shared expenses in a residential building.
+
+## Context / Constraints
+
+* This is a **Telegram WebApp / Mini App**.
+* **No authentication in the app UI** for now.
+* All Telegram users are **read-only**:
+
+  * They can **view** summary info, member list, contributions, expenses, and transactions.
+  * They **cannot create/update/delete** anything from the UI.
+* The **admin** will:
+
+  * Manage data directly in **Supabase** (via SQL / dashboard).
+  * Use the app’s read-only pages as **dashboards**.
+
+---
+
+## Tech stack
+
+* **Vite + React + TypeScript**
+* **Tailwind CSS**
+* **shadcn/ui** for UI components
+* **Supabase** (Postgres, using client from the frontend in read-only mode)
+
+Requirements:
+
+* Mobile-first layout suitable for Telegram mini app (in-webview, mostly on phones).
+* Use shadcn/ui components: `Card`, `Button`, `Input`, `Select`, `Tabs`, `Table`, `Badge`, `Progress`, etc.
+* Use idiomatic TypeScript and clean React component structure.
+
+---
+
+## Domain concept
+
+The app manages shared expenses for a building:
+
+* There are **16 households** in the building.
+* Only some are **members** of the shared expense system.
+* Each **member** contributes a **fixed monthly deposit** (currently 1000, must be **configurable**, not hardcoded).
+* Shared expenses are paid from the **common pool**:
+
+  * Individual members’ **water bills** (each has their own water meter and bill, but payments are done from the shared pool).
+  * Shared **electricity** for common areas.
+  * **Guard salary**.
+  * **Janitor salary**.
+  * Other shared costs.
+
+We track:
+
+* Members.
+* Their monthly **contributions**.
+* **Expenses** (withdrawals from the pool).
+* Optionally **individual water bills**.
+* Pool balance over time.
+* A unified **transaction ledger** of all money in/out.
+
+All of this exists in the Supabase database; the app only **reads** and displays it.
+
+---
+
+## Supabase / Postgres schema
+
+Design SQL/migrations and use these core tables:
+
+### 1. `members`
+
+```sql
+id                           uuid primary key default gen_random_uuid(),
+full_name                    text not null,
+room_id                      text not null,         -- e.g. "101" or "B-3"
+water_bill_id                text,
+water_bill_registration_name text,
+water_bill_payers            text[] default '{}',  -- list of Telegram usernames
+phone                        text,
+joined_at                    timestamp with time zone default now(),
+is_active                    boolean not null default true,
+created_at                   timestamp with time zone default now()
+```
+
+### 2. `settings`
+
+For configurable app values (like monthly contribution amount):
+
+```sql
+id      uuid primary key default gen_random_uuid(),
+key     text unique not null,
+value   jsonb not null
+```
+
+Example entry:
+
+* `key = 'monthly_contribution'`
+* `value = { "amount": 1000 }`
+
+### 3. `contributions`
+
+Represents deposits by members (money **in**):
+
+```sql
+id          uuid primary key default gen_random_uuid(),
+member_id   uuid not null references members(id),
+amount      numeric(12,2) not null,
+month       int not null,        -- 1–12
+year        int not null,        -- e.g. 2025
+paid_at     timestamp with time zone default now(),
+notes       text,
+created_at  timestamp with time zone default now()
+```
+
+### 4. `expenses`
+
+Represents shared expenses (money **out**):
+
+```sql
+id          uuid primary key default gen_random_uuid(),
+type        text not null,       -- e.g. 'water', 'electric_shared', 'guard_salary', 'janitor_salary', 'other'
+description text,
+amount      numeric(12,2) not null,
+month       int,                 -- if monthly (1–12)
+year        int,                 -- if monthly/yearly
+date        date,                -- if exact one-time
+created_at  timestamp with time zone default now(),
+metadata    jsonb
+```
+
+### 5. `water_bills` (optional but useful)
+
+Per-member water bill record:
+
+```sql
+id              uuid primary key default gen_random_uuid(),
+member_id       uuid not null references members(id),
+billing_month   int not null,        -- 1–12
+billing_year    int not null,
+amount          numeric(12,2) not null,
+bill_id         text,                -- official bill ID, optional
+paid_from_pool  boolean not null default true,
+created_at      timestamp with time zone default now()
+```
+
+### 6. (Optional but recommended) View: `v_transactions`
+
+Create a Postgres **view** that combines `contributions` (deposits) and `expenses` (withdrawals) into one unified transaction stream. Example logical shape:
+
+```sql
+-- Pseudocode / structure, implement as a real SQL VIEW
+id            text,                  -- from contributions.id or expenses.id
+source_table  text,                  -- 'contributions' | 'expenses'
+type          text,                  -- 'deposit' | 'withdraw'
+member_id     uuid,                  -- filled for deposits, usually null for expenses
+member_name   text,
+amount        numeric(12,2),         -- always positive
+direction     text,                  -- 'in' | 'out'
+created_at    timestamp with time zone,
+month         int,
+year          int,
+description   text
+```
+
+The frontend can then just `select * from v_transactions` and filter/sort as needed.
+
+If you prefer, you can skip the DB view and merge on the frontend instead.
+
+---
+
+## Pages / Features (all read-only)
+
+All pages are **read-only dashboards**, using Supabase `select` queries only.
+
+### Global UX
+
+* Implement **mobile-first** layout.
+* Simple navigation:
+
+  * Top or bottom tab navigation with items like:
+
+    * Dashboard
+    * Members
+    * Contributions
+    * Expenses
+    * Transactions
+* Use shadcn/ui components:
+
+  * `Card`, `Tabs`, `Table`, `Badge`, `Select`, `Progress`, etc.
+* Handle loading and error states for each data fetch.
+
+---
+
+### 1. Dashboard (home page)
+
+For a selected **collection period** (month/year), show global status and who hasn’t paid yet.
+
+#### Controls
+
+* Month selector (1–12).
+* Year selector.
+* Quick toggle:
+
+  * “Current month”
+  * “Previous month”
+* These controls define the **current collection period**.
+
+#### Section A – Summary Cards
+
+* **Total pool balance (all-time)**:
+
+  * `sum(all contributions) − sum(all expenses)`.
+* **Total contributions this period**:
+
+  * Sum of contributions where `month/year` match selected period.
+* **Total expenses this period**:
+
+  * Sum of expenses where `month/year` match selected period.
+* **Active members count**:
+
+  * Number of `members` with `is_active = true`.
+
+#### Section B – Collection Progress (for selected period)
+
+We want to show **how far we are in collecting the deposits** for the selected period, and who hasn’t fully paid.
+
+* Get:
+
+  * `required_amount` from `settings.monthly_contribution.amount`.
+  * `active_members_count` from `members`.
+  * `expected_total = required_amount * active_members_count`.
+  * `actual_total = sum(contributions for selected period across all members)`.
+
+* Display:
+
+  * A **progress bar** (use shadcn `Progress` or custom) where:
+
+    * `value = (actual_total / expected_total) * 100`, capped at 100%.
+  * A text summary like:
+
+    * `Collected X of Y` (e.g. `Collected 9,000 of 16,000`).
+    * `N of M members fully paid` (e.g. `9 of 16 members have paid in full`).
+
+#### Section C – Who hasn’t paid (for selected period)
+
+Need a clear list of **members who haven’t fully paid** for the current or previous month.
+
+For the selected month/year:
+
+* For each active member:
+
+  * Compute `paid_amount = sum(contributions for that member in selected period)`.
+  * Compare to `required_amount`.
+
+Classify:
+
+* **Unpaid**: `paid_amount = 0`.
+* **Partially paid**: `0 < paid_amount < required_amount`.
+* **Paid in full**: `paid_amount >= required_amount`.
+
+Display two main lists/cards:
+
+1. **Unpaid members**:
+
+   * Show each with:
+
+     * Name
+     * Room ID
+     * Phone (optional)
+     * Paid amount (0)
+   * This can be a simple list inside a `Card` titled “Unpaid this month”.
+
+2. **Partially paid members**:
+
+   * Show each with:
+
+     * Name
+     * Room ID
+     * Paid amount / required amount (e.g. `600 / 1000`).
+   * This can be another `Card` titled “Partially paid this month”.
+
+Optional: a separate “Fully paid” section or just show counts.
+
+> Important: This “who hasn’t paid” block should be very visible on the Dashboard, especially for the current and previous month (via the quick toggle).
+
+#### Section D – Contribution status overview (table)
+
+As before, but now clearly driven by the selected period:
+
+* Table of all active members with:
+
+  * Name
+  * Room ID
+  * Required amount
+  * Paid amount
+  * Status badge:
+
+    * `Paid in full` / `Partially paid` / `Unpaid`.
+
+#### Section E – Expenses overview (for selected period)
+
+* List of expenses where `month/year` match the selected period:
+
+  * Type
+  * Description
+  * Amount
+  * Date (or month/year)
+* Optional grouped totals by type.
+
+---
+
+### 2. Members page
+
+Read-only list of all members:
+
+* Show **active members** by default, with a toggle/filter to show all.
+
+Fields to display:
+
+* Full name
+* Room ID
+* Phone
+* Joined date
+* Water bill ID
+* Water bill registration name
+* Water bill payers (Telegram usernames) as small badges
+
+Use a table or list layout depending on mobile constraints.
+
+---
+
+### 3. Contributions page
+
+Focus on **per-month contributions** and a detailed **contribution log**.
+
+Controls:
+
+* Month/year selectors (default: current month/year).
+
+Section A: Member contribution status table
+
+* For each active member:
+
+  * Name
+  * Room ID
+  * Required amount (from settings)
+  * Paid amount (sum of contributions for that member for selected month/year)
+  * Status badge:
+
+    * Paid in full / Partially paid / Unpaid.
+
+Section B: Contribution log
+
+* A chronologically sorted list (newest first) of `contributions` for the selected month/year:
+
+  * Date/time (`paid_at`)
+  * Member name
+  * Amount
+  * Notes (if any)
+
+All read-only.
+
+---
+
+### 4. Expenses page
+
+Read-only expense explorer.
+
+Controls:
+
+* Filter by:
+
+  * Type (`all`, `water`, `electric_shared`, `guard_salary`, `janitor_salary`, `other`)
+  * Month/year
+
+Display:
+
+* Table or list of expenses that match filters:
+
+  * Type
+  * Description
+  * Amount
+  * Month/year or exact date
+* Show:
+
+  * **Total expenses** for the current filter selection.
+  * Optional breakdown by type.
+
+---
+
+### 5. Transactions page (global ledger)
+
+A unified **ledger** listing every money movement (deposits and withdrawals) in chronological order.
+
+Controls:
+
+* Filter by:
+
+  * Date range or month/year.
+  * Transaction type: `All`, `Deposits only`, `Expenses only`.
+  * Optional member filter (for deposit history of a single member).
+
+Data source:
+
+* If using `v_transactions` view:
+
+  * `select * from v_transactions where ... order by created_at desc`
+* Otherwise:
+
+  * Fetch `contributions` and `expenses`.
+  * Transform them into a unified `Transaction` type on the frontend.
+  * Merge and sort by `createdAt`.
+
+Example `Transaction` type:
+
+```ts
+type Transaction = {
+  id: string;
+  kind: 'deposit' | 'withdraw';
+  direction: 'in' | 'out';
+  memberId?: string | null;
+  memberName?: string | null;
+  amount: number;                // positive
+  createdAt: string;             // ISO
+  month?: number | null;
+  year?: number | null;
+  description?: string | null;   // notes / expense description
+};
+```
+
+UI:
+
+* Default sort: **newest first**.
+* Each transaction row shows:
+
+  * Label:
+
+    * Deposits: `Deposit from [Member name]`
+    * Expenses: `Expense: [type]`
+  * Subtitle:
+
+    * For deposit: `month/year` and note (if present).
+    * For expense: `description` and date/month-year.
+  * Date/time.
+  * Amount:
+
+    * `+` for deposits (IN), `-` for expenses (OUT).
+    * Color distinction (e.g. green vs red).
+  * Badge:
+
+    * `IN` for deposits.
+    * `OUT` for expenses.
+
+---
+
+### 6. Optional Water Bills page
+
+If `water_bills` is used:
+
+* Controls:
+
+  * Month/year selector.
+* Show a table of:
+
+  * Member name
+  * Room ID
+  * Water bill amount
+  * Bill ID
+  * Paid from pool: yes/no
+
+---
+
+## Implementation Tasks
+
+1. **Project setup**
+
+   * Create a **Vite + React + TypeScript** app.
+   * Install and configure **Tailwind CSS**.
+   * Install and set up **shadcn/ui** components.
+   * Set up routing (React Router or similar) with pages:
+
+     * `/dashboard`
+     * `/members`
+     * `/contributions`
+     * `/expenses`
+     * `/transactions`
+     * (optional) `/water-bills`
+   * Ensure mobile-first design for Telegram WebApp.
+
+2. **Supabase integration**
+
+   * Initialize Supabase client.
+   * Implement read-only data fetching hooks/services:
+
+     * `useMembers`
+     * `useSettings`
+     * `useContributions`
+     * `useExpenses`
+     * `useTransactions`
+   * All operations must be **read-only** (`select` only).
+
+3. **Pages implementation**
+
+   * Implement **Dashboard** with:
+
+     * Month/year controls and “current / previous month” toggle.
+     * Summary cards (pool balance, contributions this period, expenses this period, active members).
+     * **Collection progress section** (expected vs collected, progress bar, counts).
+     * **Unpaid / partially paid members section** for the selected period.
+     * Contribution status table.
+     * Expenses overview.
+
+   * Implement **Members**, **Contributions**, **Expenses**, and **Transactions** pages as described.
+
+4. **Polish**
+
+   * Error and loading states.
+   * Responsive design tuned for small screens.
+   * Clean, consistent styling via Tailwind + shadcn.
+
+---
+
+**Goal:** Generate the implementation skeleton (components, pages, routing, Supabase integration, and especially the Dashboard’s collection progress + unpaid members sections) following the above design, ready to be used as a Telegram mini app (read-only).
